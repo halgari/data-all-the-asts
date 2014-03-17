@@ -6,6 +6,15 @@
 ;; 2. Analyzer
 ;; 3. Emitter
 
+
+;; Clojure Lexer/Parser (they are often combined in lisps)
+(read-string "(+ 1 2)")
+
+;; Currently the analyzer and emitter are combined in Clojure:
+
+(eval '(+ 1 2))
+
+
 ;; The data exchange between the analyzer and the emitter is known as
 ;; the Abstract Syntax Tree or "AST". Clojure is no exception. The
 ;; Lexer/Parser is the reader, and we can invoke the analyzer via Java
@@ -153,7 +162,7 @@
 ;; the order they would be executed when compiled:
 
 {:op :if
- :children [test then else]
+ :children [:test :then :else]
  :test {:op :const
         :children []
         :value true
@@ -218,7 +227,9 @@
 
 
 (to-clj (jvm-an/analyze '((fn [x & r] (let [v x] (if v r 0)
-                                           ))) (jvm-an/empty-env)))
+                                          ))) (jvm-an/empty-env)))
+
+(to-clj (jvm-an/analyze '(let [x 42] x) (jvm-an/empty-env)))
 
 ;; A AST->CLJ emitter...because why the heck not?
 
@@ -339,19 +350,23 @@
    {}
    (range (count keys))))
 
+
+(defn debug [x]
+  (clojure.pprint/pprint x)
+  x)
+
 (defn make-assoc-call [const non-const env]
-  (println non-const)
   {:op :invoke
    :env env
+   :children [:fn :args]
    :fn {:op :var
         :var #'assoc
         :env env}
-   :args (vec (apply
-               concat [{:op :map
-                        :keys (map :key const)
-                        :vals (map :value const)
-                        :env env}]
-               (mapcat (juxt :key :value) non-const)))})
+   :args (concat [{:op :map
+                   :keys (map :key const)
+                   :vals (map :value const)
+                   :env env}]
+                 (mapcat (juxt :key :value) non-const))})
 
 (defn map-optimizer [{:keys [op keys vals env] :as ast}]
   (if (= op :map)
@@ -384,3 +399,128 @@
       (to-clj)))
 
 (run-map-optimizer '{:a 1 :b (+ 4 3)})
+
+
+
+;; Passes can be combined by using comp:
+
+(defn run-passes [form]
+  (let [passes (comp (partial simple-const-fold (atom {}))
+                     map-optimizer)]
+    (-> (jvm-an/analyze form
+                        (jvm-an/empty-env))
+        (an-ast/postwalk passes)
+        to-clj)))
+
+
+;; Notice how x is removed, but y since its value is an expression.
+;; Since :a and :b are now constant the 2nd pass converts that part of
+;; the map to a const and then calls assoc to pull in :c
+
+(run-passes '(let [x 42
+                   y (+ 1 2)]
+               
+               {:a 1 :b x :c y}))
+
+
+;; Okay, now let's create a real constant folder
+
+;; Helper function
+
+(def const-fold-node nil)
+(defmulti const-fold-node (fn [ast consts]
+                            (:op ast)))
+
+(defmethod const-fold-node :const
+  [{:keys [name form] :as ast} consts]
+  ast)
+
+(defmethod const-fold-node :binding
+  [{:keys [name init] :as ast} consts]
+  (if (const? init)
+    (do (swap! consts assoc name init)
+        nil)
+    ast))
+
+(defmethod const-fold-node :do
+  [{:keys [statements ret] :as ast} consts]
+  (if-let [statements (not-empty (filter const? statements))]
+    (assoc ast :statements statements)
+    ret))
+
+(defmethod const-fold-node :local
+  [{:keys [name init] :as ast} consts]
+  (if-let [val (get @consts name)]
+    val
+    ast))
+
+(defmethod const-fold-node :let
+  [{:keys [bindings body] :as ast} consts]
+  (let [bindings (remove nil? bindings)]
+    (if (empty? bindings)
+      body
+      (assoc ast :bindings bindings))))
+
+(defmethod const-fold-node :var
+  [ast consts]
+  ast)
+
+(defmethod const-fold-node :map
+  [{:keys [keys vals env]} consts]
+  (if (and (every? const? keys)
+           (every? const? vals))
+    {:op :const
+     :form (zipmap (map :form keys)
+                   (map :form vals))
+     :env env}))
+
+
+(def pure-vars #{#'assoc
+                 #'dissoc
+                 #'into})
+
+(defn var-node? [ast]
+  (= (:op ast) :var))
+
+(defmethod const-fold-node :invoke
+  [{:keys [fn args env] :as ast} consts]
+  (if (and (var-node? fn)
+           (contains? pure-vars (:var fn))
+           (every? const? args))
+    {:op :const
+     :form (apply (:var fn) (map :form args))
+     :env env}
+    ast))
+
+(def approved-static-calls
+  #{[clojure.lang.Numbers "add"]})
+
+(defmethod const-fold-node :static-call
+  [{:keys [class method args env] :as ast} consts]
+  (if (and (contains? approved-static-calls [class (name method)])
+           (every? const? args))
+    {:op :const
+     :form (eval `(. ~class ~(symbol method) ~@(map :form args)))
+     :env env}
+    ast))
+
+
+(defn run-constant-folding [form]
+  (-> (jvm-an/analyze form
+                      (jvm-an/empty-env))
+      (an-ast/postwalk #(const-fold-node % (atom {})))
+      to-clj))
+
+(run-constant-folding '(let [x 42]
+                         (dissoc {:a (+ 3 1)
+                                  :c (into [4 5] [1 2 3])
+                                  :b (assoc {} :c 42)}
+                                 :b)))
+
+
+
+;; Room for improvements
+;; 1) replace CLJS analyzer (GSOC project)
+;; 2) replace core.async / core.typed analyzer
+;; 3) integration with lein/clojure compiler?
+;; 4) SSA layer?
