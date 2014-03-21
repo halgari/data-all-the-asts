@@ -27,7 +27,7 @@
 ;; that?
 
 
-;; Most ASTs (and the JAVA AST is one) are built on closed types. To
+;; Most ASTs (and the Clojure JVM AST is one) are built on closed types. To
 ;; really dig into them you would need to read the sourcecode and
 ;; dispatch on the node type. You can dig into Compiler.java if you
 ;; want and figure out what all these types do and how to access them.
@@ -144,6 +144,7 @@
 ;; That's simple, what about a if?
 
 {:op :if
+ :meta {:line 0 :col 3}
  :test {:op :const
         :value true
         :type :boolean}
@@ -177,6 +178,16 @@
         :type :integer}}
 
 
+;;; So there are several parts to a AST-as-data
+
+
+:op ;; allows for polymorphic dispatch on the node type
+:form ;; original un-analized form
+:children ;; child nodes in "execution order"
+:env ;; a grab-bag of data about the context of the node
+
+
+
 ;; Let's also assume we can have nodes like the following:
 
 (def test-ast {:op :do
@@ -192,7 +203,7 @@
 
 ;; Now we can write a simple pre-walk function:
 
-(defn prewalk [ast f]
+(defn postwalk [ast f]
   (f (reduce
       (fn [acc key]
         (let [value (get ast key)]
@@ -205,11 +216,11 @@
       (:children ast))))
 
 
-(prewalk test-ast (fn [ast]
+(postwalk test-ast (fn [ast]
                     (println (:op ast))
                     ast))
 
-(prewalk test-ast (fn [ast]
+(postwalk test-ast (fn [ast]
                     (println (:op ast))
                     [:replaced]))
 
@@ -218,8 +229,18 @@
 
 (require '[clojure.tools.analyzer.jvm :as jvm-an])
 
+(keys (deref (:namespaces (jvm-an/empty-env))))
 
 (clojure.pprint/pprint (jvm-an/analyze '(if true 42 0) (jvm-an/empty-env)))
+
+
+;; let's look at the env a bit
+
+(-> (jvm-an/analyze '(fn [x] x) (jvm-an/empty-env))
+    :methods
+    first
+    :body
+    :env)
 
 
 (defmulti to-clj :op)
@@ -229,7 +250,7 @@
 (to-clj (jvm-an/analyze '((fn [x & r] (let [v x] (if v r 0)
                                           ))) (jvm-an/empty-env)))
 
-(to-clj (jvm-an/analyze '(let [x 42] x) (jvm-an/empty-env)))
+(to-clj (jvm-an/analyze '(let [x 42 x x] x) (jvm-an/empty-env)))
 
 ;; A AST->CLJ emitter...because why the heck not?
 
@@ -250,7 +271,6 @@
 
 (defmethod to-clj :fn
   [{:keys [methods internal-name] :as ast}]
-  (println (keys ast))
   `(fn ~(symbol internal-name) ~@(map to-clj methods)))
 
 (defmethod to-clj :fn-method
@@ -283,58 +303,117 @@
 (require '[clojure.tools.analyzer.ast :as an-ast])
 
 
-(defn simple-const-fold
-  ([state {:keys [op] :as ast}]
-     (cond (and (= op :binding)
-              (= (-> ast :init :op) :const))
-       (do (swap! state assoc (:name ast) (:init ast))
-           (assoc ast :init {:op :const :form nil}))
+;; Okay, now let's create a constant folder
 
-       (and (= op :local)
-            (contains? @state (:name ast)))
-
-       (get @state (:name ast))
-
-       (and (= op :if)
-            (= (-> ast :test :op) :const))
-
-       (if (-> ast :test :form)
-         (:then ast)
-         (:else ast))
-       
-
-       :else ast)))
-
-(let [passes (partial simple-const-fold (atom {}))]
-  (-> (jvm-an/analyze '(let [x 42]
-                         (if x
-                           true
-                           false))
-                      (jvm-an/empty-env))
-
-      (an-ast/postwalk passes)
-
-      (to-clj)))
-
-(defn constant-folding-optimizer [form]
-  (let [passes (partial simple-const-fold (atom {}))]
-    (-> (jvm-an/analyze form
-                        (jvm-an/empty-env))
-
-        (an-ast/postwalk passes)
-
-        (to-clj))))
-
-(constant-folding-optimizer '(let [x 42
-                                   y x]
-                               (let [z y]
-                                 (if z
-                                   true
-                                   false))))
-
+;; Helper function
 
 (defn const? [ast]
   (= (:op ast) :const))
+
+
+
+(def const-fold-node nil)
+(defmulti const-fold-node (fn [ast consts]
+                            (:op ast)))
+
+(defmethod const-fold-node :const
+  [{:keys [name form] :as ast} consts]
+  ast)
+
+(defmethod const-fold-node :binding
+  [{:keys [name init] :as ast} consts]
+  (if (const? init)
+    (do (swap! consts assoc name init)
+        nil)
+    ast))
+
+(defmethod const-fold-node :do
+  [{:keys [statements ret] :as ast} consts]
+  (if-let [statements (not-empty (filter const? statements))]
+    (assoc ast :statements statements)
+    ret))
+
+(defmethod const-fold-node :local
+  [{:keys [name init] :as ast} consts]
+  (if-let [val (get @consts name)]
+    val
+    ast))
+
+(defmethod const-fold-node :let
+  [{:keys [bindings body] :as ast} consts]
+  (let [bindings (remove nil? bindings)]
+    (if (empty? bindings)
+      body
+      (assoc ast :bindings bindings))))
+
+(defmethod const-fold-node :var
+  [ast consts]
+  ast)
+
+(defmethod const-fold-node :map
+  [{:keys [keys vals env] :as ast} consts]
+  (if (and (every? const? keys)
+           (every? const? vals))
+    {:op :const
+     :form (zipmap (map :form keys)
+                   (map :form vals))
+     :env env}
+    ast))
+
+(defmethod const-fold-node :fn
+  [ast consts]
+  ast)
+
+(defmethod const-fold-node :fn-method
+  [ast consts]
+  ast)
+
+
+(def pure-vars #{#'assoc
+                 #'dissoc
+                 #'into})
+
+(defn var-node? [ast]
+  (= (:op ast) :var))
+
+(defmethod const-fold-node :invoke
+  [{:keys [fn args env] :as ast} consts]
+  (if (and (var-node? fn)
+           (contains? pure-vars (:var fn))
+           (every? const? args))
+    {:op :const
+     :form (apply (:var fn) (map :form args))
+     :env env}
+    ast))
+
+(def approved-static-calls
+  #{[clojure.lang.Numbers "add"]})
+
+(defmethod const-fold-node :static-call
+  [{:keys [class method args env] :as ast} consts]
+  (if (and (contains? approved-static-calls [class (name method)])
+           (every? const? args))
+    {:op :const
+     :form (eval `(. ~class ~(symbol method) ~@(map :form args)))
+     :env env}
+    ast))
+
+
+(defn run-constant-folding [form]
+  (let [state (atom {})]
+    (-> (jvm-an/analyze form
+                        (jvm-an/empty-env))
+        (an-ast/postwalk #(const-fold-node % state))
+        to-clj)))
+
+(run-constant-folding '(let [x 42]
+                         (dissoc {:a (+ x 1)
+                                  :c (into [4 5] [1 2 3])
+                                  :b (assoc {} :c 42)}
+                                 :b)))
+
+
+;;;;;; Map optimizers ;;;;;
 
 (defn find-non-const-idxs [keys values]
   (reduce
@@ -400,12 +479,21 @@
 
 (run-map-optimizer '{:a 1 :b (+ 4 3)})
 
+;; Simple verify pass
+(defn verify-invoke [{:keys [fn args op] :as ast}]
+  (when (and (= op :invoke)
+             (= (:op fn) :const))
+    (assert (not= (type (:form fn)) java.lang.Long) "Cannot call an integer"))
+  ast)
+
 
 
 ;; Passes can be combined by using comp:
 
 (defn run-passes [form]
-  (let [passes (comp (partial simple-const-fold (atom {}))
+  (let [state (atom {})
+        passes (comp verify-invoke
+                     #(const-fold-node % state)
                      map-optimizer)]
     (-> (jvm-an/analyze form
                         (jvm-an/empty-env))
@@ -413,109 +501,36 @@
         to-clj)))
 
 
+
 ;; Notice how x is removed, but y since its value is an expression.
 ;; Since :a and :b are now constant the 2nd pass converts that part of
 ;; the map to a const and then calls assoc to pull in :c
 
-(run-passes '(let [x 42
-                   y (+ 1 2)]
-               
-               {:a 1 :b x :c y}))
+(run-passes '(fn [x] (let [x 42
+                          y (- (+ 1 2) x)]
+                  
+                    {:a 1 :b x :c y})))
 
 
-;; Okay, now let's create a real constant folder
+;;; Examples from core.async:
 
-;; Helper function
-
-(def const-fold-node nil)
-(defmulti const-fold-node (fn [ast consts]
-                            (:op ast)))
-
-(defmethod const-fold-node :const
-  [{:keys [name form] :as ast} consts]
-  ast)
-
-(defmethod const-fold-node :binding
-  [{:keys [name init] :as ast} consts]
-  (if (const? init)
-    (do (swap! consts assoc name init)
-        nil)
+(defn mark-transitions
+  [transitions {:keys [op fn] :as ast}]
+  (if (and (= op :invoke)
+           (= (:op fn) :var)
+           (contains? transitions (var-name (:var fn))))
+    (merge ast
+           {:op :transition
+            :name (get transitions (var-name (:var fn)))})
     ast))
 
-(defmethod const-fold-node :do
-  [{:keys [statements ret] :as ast} consts]
-  (if-let [statements (not-empty (filter const? statements))]
-    (assoc ast :statements statements)
-    ret))
-
-(defmethod const-fold-node :local
-  [{:keys [name init] :as ast} consts]
-  (if-let [val (get @consts name)]
-    val
+(defn propagate-transitions [ast]
+  (if (or (= (:op ast) :transition)
+          (some #(or (= (:op %) :transition)
+                     (::transform? %))
+                (ast/children ast)))
+    (assoc ast ::transform? true)
     ast))
-
-(defmethod const-fold-node :let
-  [{:keys [bindings body] :as ast} consts]
-  (let [bindings (remove nil? bindings)]
-    (if (empty? bindings)
-      body
-      (assoc ast :bindings bindings))))
-
-(defmethod const-fold-node :var
-  [ast consts]
-  ast)
-
-(defmethod const-fold-node :map
-  [{:keys [keys vals env]} consts]
-  (if (and (every? const? keys)
-           (every? const? vals))
-    {:op :const
-     :form (zipmap (map :form keys)
-                   (map :form vals))
-     :env env}))
-
-
-(def pure-vars #{#'assoc
-                 #'dissoc
-                 #'into})
-
-(defn var-node? [ast]
-  (= (:op ast) :var))
-
-(defmethod const-fold-node :invoke
-  [{:keys [fn args env] :as ast} consts]
-  (if (and (var-node? fn)
-           (contains? pure-vars (:var fn))
-           (every? const? args))
-    {:op :const
-     :form (apply (:var fn) (map :form args))
-     :env env}
-    ast))
-
-(def approved-static-calls
-  #{[clojure.lang.Numbers "add"]})
-
-(defmethod const-fold-node :static-call
-  [{:keys [class method args env] :as ast} consts]
-  (if (and (contains? approved-static-calls [class (name method)])
-           (every? const? args))
-    {:op :const
-     :form (eval `(. ~class ~(symbol method) ~@(map :form args)))
-     :env env}
-    ast))
-
-
-(defn run-constant-folding [form]
-  (-> (jvm-an/analyze form
-                      (jvm-an/empty-env))
-      (an-ast/postwalk #(const-fold-node % (atom {})))
-      to-clj))
-
-(run-constant-folding '(let [x 42]
-                         (dissoc {:a (+ 3 1)
-                                  :c (into [4 5] [1 2 3])
-                                  :b (assoc {} :c 42)}
-                                 :b)))
 
 
 
